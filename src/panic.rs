@@ -105,3 +105,38 @@ pub fn run_snapshot_assertion<F: FnOnce()>(snapshot_name: &str, assertion: F) ->
         ))),
     }
 }
+
+/// Runs an insta assertion but reports the outcome as a boolean instead of
+/// raising on a snapshot mismatch.
+///
+/// Returns `Ok(true)` when the snapshot matched (or was updated) and `Ok(false)`
+/// for insta's expected mismatch panic. Any other (unexpected) panic is still
+/// surfaced as a Python `AssertionError`. This lets callers that want to enrich
+/// the failure (e.g. render a readable CSV/JSON diff for a binary dataframe
+/// snapshot) decide what to do on a mismatch while insta still writes its
+/// pending `.new` file as usual.
+pub fn run_snapshot_assertion_matched<F: FnOnce()>(
+    snapshot_name: &str,
+    assertion: F,
+) -> PyResult<bool> {
+    let guard = AssertionGuard::enter();
+    let outcome = panic::catch_unwind(AssertUnwindSafe(assertion));
+    drop(guard);
+
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(payload) => {
+            let raw = panic_message(payload.as_ref());
+            if raw
+                .as_deref()
+                .is_some_and(|m| m.starts_with("snapshot assertion for"))
+            {
+                Ok(false)
+            } else {
+                Err(PyAssertionError::new_err(raw.unwrap_or_else(|| {
+                    format!("snapshot '{snapshot_name}' assertion failed")
+                })))
+            }
+        }
+    }
+}

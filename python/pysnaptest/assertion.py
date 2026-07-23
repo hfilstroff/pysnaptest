@@ -16,6 +16,8 @@ from ._pysnaptest import (
     assert_csv_snapshot as _assert_csv_snapshot,
     assert_snapshot as _assert_snapshot,
     assert_binary_snapshot as _assert_binary_snapshot,
+    assert_binary_snapshot_capturing_previous as _assert_binary_snapshot_capturing_previous,
+    render_text_diff as _render_text_diff,
     SnapshotInfo,
 )
 from .encoders import is_jsonable_object, to_jsonable
@@ -168,6 +170,126 @@ def try_is_polars_df(maybe_df: Any) -> bool:
     return isinstance(maybe_df, pl.DataFrame)
 
 
+def _df_to_readable(df: Any, readable_diff: str) -> str:
+    """Render a DataFrame to deterministic CSV or JSON text for diffing.
+
+    Args:
+        df: A pandas or polars ``DataFrame``.
+        readable_diff: ``"csv"`` or ``"json"``.
+
+    Returns:
+        str: A line-oriented text rendering (one row per line for CSV, an
+        indented list of row objects for JSON) suitable for a unified diff.
+
+    Raises:
+        ValueError: If ``readable_diff`` is not ``"csv"`` or ``"json"``.
+    """
+
+    if readable_diff == "csv":
+        if try_is_pandas_df(df):
+            return df.to_csv(index=False)
+        return df.write_csv()
+    if readable_diff == "json":
+        import json
+
+        if try_is_pandas_df(df):
+            rows = df.to_dict(orient="records")
+        else:
+            rows = df.to_dicts()
+        return json.dumps(rows, indent=2, default=str, ensure_ascii=False)
+    raise ValueError(
+        f"Unsupported readable_diff format: {readable_diff!r}. Use 'csv' or 'json'."
+    )
+
+
+def _decode_binary_dataframe(previous: bytes, df: Any, extension: str) -> Any:
+    """Reconstruct a DataFrame from the committed binary snapshot bytes.
+
+    The committed bytes are decoded with the same library as ``df`` (so the
+    rendered diff is apples-to-apples) and the same format used to store them.
+
+    Args:
+        previous: The committed sidecar bytes.
+        df: The current DataFrame (used only to pick pandas vs polars).
+        extension: The stored binary format (``"parquet"`` or ``"bin"``).
+
+    Returns:
+        Any: The decoded pandas or polars ``DataFrame``.
+    """
+
+    import io
+
+    buffer = io.BytesIO(previous)
+    if try_is_pandas_df(df):
+        import pandas as pd
+
+        return pd.read_parquet(buffer)
+
+    import polars as pl
+
+    if extension == "bin":
+        return pl.DataFrame.deserialize(buffer, format="binary")
+    return pl.read_parquet(buffer)
+
+
+def _assert_binary_dataframe_snapshot(
+    df: Any,
+    result: bytes,
+    extension: str,
+    snapshot_path: Optional[str],
+    snapshot_name: Optional[str],
+    allow_duplicates: bool,
+    readable_diff: Optional[str],
+) -> None:
+    """Assert a DataFrame's binary snapshot, showing a readable diff on mismatch.
+
+    Equality is insta's exact byte comparison of the stored binary (e.g.
+    parquet). When ``readable_diff`` is ``None`` this behaves exactly like
+    :func:`assert_binary_snapshot`. Otherwise, on a byte mismatch the committed
+    snapshot is decompressed and a CSV/JSON unified diff (rendered with insta's
+    own diff engine) is attached to the raised ``AssertionError``.
+
+    Args:
+        df: The DataFrame being snapshotted.
+        result: The serialized binary bytes to store and compare.
+        extension: The binary format extension (``"parquet"`` or ``"bin"``).
+        snapshot_path: Optional path override for storing the snapshot.
+        snapshot_name: Optional name override for the snapshot file.
+        allow_duplicates: Whether to allow duplicate snapshot names.
+        readable_diff: ``None`` (byte-only), ``"csv"`` or ``"json"``.
+
+    Raises:
+        AssertionError: If the snapshot does not match, with a readable diff
+            appended when ``readable_diff`` is set.
+    """
+
+    test_info = extract_from_pytest_env(snapshot_path, snapshot_name, allow_duplicates)
+
+    if readable_diff is None:
+        _assert_binary_snapshot(test_info, extension, result)
+        return
+
+    previous = _assert_binary_snapshot_capturing_previous(test_info, extension, result)
+    if previous is None:
+        return
+
+    base_message = (
+        "DataFrame snapshot did not match the stored value (readable diff below). "
+        "Update the snapshot if this change is intentional."
+    )
+    if not previous:
+        raise AssertionError(base_message)
+
+    old_df = _decode_binary_dataframe(previous, df, extension)
+    diff = _render_text_diff(
+        _df_to_readable(old_df, readable_diff),
+        _df_to_readable(df, readable_diff),
+        "committed",
+        "new",
+    )
+    raise AssertionError(f"{base_message}\n\n{diff}")
+
+
 def assert_pandas_dataframe_snapshot(
     df: pd.DataFrame,
     snapshot_path: Optional[str] = None,
@@ -175,6 +297,7 @@ def assert_pandas_dataframe_snapshot(
     redactions: Optional[Dict[str, Union[str, int, None]]] = None,
     dataframe_snapshot_format: str = "csv",
     allow_duplicates: bool = False,
+    readable_diff: Optional[str] = None,
     *args,
     **kwargs,
 ) -> None:
@@ -187,6 +310,9 @@ def assert_pandas_dataframe_snapshot(
         redactions: Mapping of selectors to replacement values.
         dataframe_snapshot_format: One of ``"csv"``, ``"json"`` or ``"parquet"``.
         allow_duplicates: Whether to allow duplicate snapshot names.
+        readable_diff: For the binary ``"parquet"`` format only, show a readable
+            ``"csv"`` or ``"json"`` diff on mismatch instead of just reporting a
+            byte difference. ``None`` (default) keeps the byte-only behavior.
         *args: Positional arguments forwarded to the DataFrame export method.
         **kwargs: Keyword arguments forwarded to the DataFrame export method.
     """
@@ -203,12 +329,14 @@ def assert_pandas_dataframe_snapshot(
         )
     elif dataframe_snapshot_format == "parquet":
         result = df.to_parquet(engine="pyarrow")
-        assert_binary_snapshot(
+        _assert_binary_dataframe_snapshot(
+            df,
             result,
+            dataframe_snapshot_format,
             snapshot_path,
             snapshot_name,
-            extension=dataframe_snapshot_format,
-            allow_duplicates=allow_duplicates,
+            allow_duplicates,
+            readable_diff,
         )
     else:
         raise ValueError(
@@ -223,6 +351,7 @@ def assert_polars_dataframe_snapshot(
     redactions: Optional[Dict[str, Union[str, int, None]]] = None,
     dataframe_snapshot_format: str = "csv",
     allow_duplicates: bool = False,
+    readable_diff: Optional[str] = None,
     *args,
     **kwargs,
 ) -> None:
@@ -235,6 +364,9 @@ def assert_polars_dataframe_snapshot(
         redactions: Mapping of selectors to replacement values.
         dataframe_snapshot_format: One of ``"csv"``, ``"json"`` or ``"bin"``.
         allow_duplicates: Whether to allow duplicate snapshot names.
+        readable_diff: For the binary ``"bin"`` format only, show a readable
+            ``"csv"`` or ``"json"`` diff on mismatch instead of just reporting a
+            byte difference. ``None`` (default) keeps the byte-only behavior.
         *args: Positional arguments forwarded to the DataFrame export method.
         **kwargs: Keyword arguments forwarded to the DataFrame export method.
     """
@@ -251,12 +383,14 @@ def assert_polars_dataframe_snapshot(
         )
     elif dataframe_snapshot_format == "bin":
         result = df.serialize(format="binary", *args, **kwargs)
-        assert_binary_snapshot(
+        _assert_binary_dataframe_snapshot(
+            df,
             result,
+            dataframe_snapshot_format,
             snapshot_path,
             snapshot_name,
-            extension=dataframe_snapshot_format,
-            allow_duplicates=allow_duplicates,
+            allow_duplicates,
+            readable_diff,
         )
     else:
         raise ValueError(
@@ -271,6 +405,7 @@ def assert_dataframe_snapshot(
     redactions: Optional[Dict[str, Union[str, int, None]]] = None,
     dataframe_snapshot_format: str = "csv",
     allow_duplicates: bool = False,
+    readable_diff: Optional[str] = None,
     *args,
     **kwargs,
 ) -> None:
@@ -284,6 +419,9 @@ def assert_dataframe_snapshot(
         dataframe_snapshot_format: Format to serialize the DataFrame as. Supported
             values are ``"csv"``, ``"json"``, ``"parquet"`` and ``"bin"``.
         allow_duplicates: Whether to allow duplicate snapshot names.
+        readable_diff: For the binary formats (``"parquet"``/``"bin"``) only, show
+            a readable ``"csv"`` or ``"json"`` diff on mismatch instead of just a
+            byte difference. ``None`` (default) keeps the byte-only behavior.
         *args: Positional arguments forwarded to the DataFrame export method.
         **kwargs: Keyword arguments forwarded to the DataFrame export method.
     """
@@ -296,6 +434,7 @@ def assert_dataframe_snapshot(
             redactions,
             dataframe_snapshot_format,
             allow_duplicates,
+            readable_diff,
             *args,
             **kwargs,
         )
@@ -307,6 +446,7 @@ def assert_dataframe_snapshot(
             redactions,
             dataframe_snapshot_format,
             allow_duplicates,
+            readable_diff,
             *args,
             **kwargs,
         )
@@ -364,6 +504,7 @@ def insta_snapshot(
     dataframe_snapshot_format: str = "csv",
     allow_duplicates: bool = False,
     custom_encoder: Optional[Dict[type, Callable[[Any], Any]]] = None,
+    readable_diff: Optional[str] = None,
 ) -> None:
     """Dispatch a value to the appropriate snapshot assertion.
 
@@ -379,6 +520,8 @@ def insta_snapshot(
         allow_duplicates: Whether to allow duplicate snapshot names.
         custom_encoder: Optional mapping of types to encoder callables used when
             normalizing JSON snapshots.
+        readable_diff: For binary DataFrame formats, show a ``"csv"``/``"json"``
+            diff on mismatch. ``None`` (default) keeps byte-only reporting.
     """
 
     if isinstance(result, (dict, list)):
@@ -405,6 +548,7 @@ def insta_snapshot(
             redactions,
             dataframe_snapshot_format,
             allow_duplicates,
+            readable_diff,
         )
     elif is_jsonable_object(result):
         assert_json_snapshot(
@@ -439,6 +583,7 @@ def snapshot(
     dataframe_snapshot_format: str = "csv",
     allow_duplicates: bool = False,
     custom_encoder: Optional[Dict[type, Callable[[Any], Any]]] = None,
+    readable_diff: Optional[str] = None,
 ) -> Callable:  # noqa: F811
     ...
 
@@ -452,6 +597,7 @@ def snapshot(  # noqa: F811
     dataframe_snapshot_format: str = "csv",
     allow_duplicates: bool = False,
     custom_encoder: Optional[Dict[type, Callable[[Any], Any]]] = None,
+    readable_diff: Optional[str] = None,
 ) -> Callable:
     """Decorator that snapshots the return value of ``func``.
 
@@ -464,6 +610,9 @@ def snapshot(  # noqa: F811
         allow_duplicates: Whether to allow duplicate snapshot names.
         custom_encoder: Optional mapping of types to encoder callables used when
             normalizing JSON snapshots.
+        readable_diff: For binary DataFrame formats (``"parquet"``/``"bin"``),
+            show a readable ``"csv"``/``"json"`` diff on mismatch instead of just
+            a byte difference. ``None`` (default) keeps byte-only reporting.
 
     Returns:
         Callable: The wrapped function.
@@ -486,6 +635,7 @@ def snapshot(  # noqa: F811
                     dataframe_snapshot_format=dataframe_snapshot_format,
                     allow_duplicates=allow_duplicates,
                     custom_encoder=custom_encoder,
+                    readable_diff=readable_diff,
                 )
 
             return asserted_func
@@ -501,6 +651,7 @@ def snapshot(  # noqa: F811
                 dataframe_snapshot_format=dataframe_snapshot_format,
                 allow_duplicates=allow_duplicates,
                 custom_encoder=custom_encoder,
+                readable_diff=readable_diff,
             )
 
         return asserted_func
